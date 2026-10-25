@@ -198,6 +198,174 @@ class InterProjectionTransform(mtransforms.Transform):
                                         self.source_projection)
 
 
+def _antimeridian(projection):
+    """
+    Return the longitude of the meridian along which the given projection
+    is cut, or None if the projection is not known to be cut along a single
+    meridian.
+
+    """
+    if (isinstance(projection, ccrs.RotatedPole) or
+            not isinstance(projection, (ccrs._RectangularProjection,
+                                        ccrs._WarpedRectangularProjection,
+                                        ccrs.Mercator))):
+        return None
+    params = projection.proj4_params
+    try:
+        return float(params.get('lon_0', 0)) + float(params.get('pm', 0)) + 180
+    except (TypeError, ValueError):
+        return None
+
+
+def _cache_projected_cells(paths, source_projection, target_projection):
+    """
+    Project the quadrilateral cells of a pcolor collection all at once, and
+    add the results to the path transform cache.
+
+    :meth:`InterProjectionTransform.transform_path_non_affine` projects each
+    path with :meth:`~cartopy.crs.Projection.project_geometry`, which takes
+    milliseconds per path. That dominates the time taken by
+    :meth:`GeoAxes.pcolor`, and so by :meth:`GeoAxes.pcolormesh` when it has
+    to draw thousands of cells that are cut by the edge of the map.
+
+    For a PlateCarree source and a target which is cut along a single
+    meridian, each cell is instead split at that meridian and clipped to the
+    valid latitudes in source coordinates, and the vertices of all of the
+    pieces are projected with a single call to ``transform_points``. A cell
+    is only cached if every vertex lands within the limits of the target and
+    every edge projects to a straight line, using the same test that
+    ``project_geometry`` uses to decide whether a line needs more points.
+    The remaining cells are left to ``project_geometry``.
+
+    """
+    if not paths or not isinstance(source_projection, ccrs.PlateCarree):
+        return
+    antimeridian = _antimeridian(target_projection)
+    if antimeridian is None:
+        return
+    # Only handle paths which are all a single ring of the same length, as
+    # made by pcolor.
+    codes = paths[0].codes
+    n_verts = len(paths[0].vertices)
+    if n_verts < 4 or (codes is not None and
+                       np.count_nonzero(codes == mpath.Path.MOVETO) != 1):
+        return
+    for path in paths:
+        if len(path.vertices) != n_verts or not np.array_equal(path.codes,
+                                                               codes):
+            return
+    verts = np.stack([path.vertices for path in paths])
+    if codes is not None and codes[-1] == mpath.Path.CLOSEPOLY:
+        verts = verts[:, :-1]
+
+    # Find the first cut east of the western edge of each cell, in source
+    # coordinates.
+    cut0 = antimeridian - source_projection.proj4_params['pm']
+    with np.errstate(invalid='ignore'):
+        x_min = verts[..., 0].min(axis=1)
+        x_max = verts[..., 0].max(axis=1)
+        n_cut = np.floor((x_min - cut0) / 360) + 1
+    polys = shapely.polygons(verts)
+    ok = (np.isfinite(verts).all(axis=(1, 2)) &
+          (x_max < cut0 + 360 * (n_cut + 1)) &
+          shapely.is_valid(polys))
+
+    # Split the cells either side of the cut, nudging the pieces slightly
+    # away from it so that each vertex is projected to the correct side.
+    eps = 1e-7
+    y_min, y_max = source_projection.y_limits
+    pieces = np.empty((2, len(paths)), dtype=object)
+    for n in np.unique(n_cut[ok]):
+        group = ok & (n_cut == n)
+        cut = cut0 + 360 * n
+        pieces[0, group] = shapely.clip_by_rect(
+            polys[group], cut - 360 + eps, y_min, cut - eps, y_max)
+        pieces[1, group] = shapely.clip_by_rect(
+            polys[group], cut + eps, y_min, cut + 360 - eps, y_max)
+    pieces = pieces[:, ok]
+    cell_index = np.broadcast_to(np.flatnonzero(ok), pieces.shape)
+    keep = ~shapely.is_empty(pieces)
+    pieces, cell_index = pieces[keep], cell_index[keep]
+    # Order the pieces by cell, with the western piece first.
+    order = np.argsort(cell_index, kind='stable')
+    pieces, cell_index = pieces[order], cell_index[order]
+    ok[cell_index[shapely.get_type_id(pieces) !=
+                  shapely.GeometryType.POLYGON]] = False
+    if not len(pieces):
+        return
+
+    # The exterior rings of the pieces, including their closing points.
+    xy, piece_index = shapely.get_coordinates(
+        shapely.get_exterior_ring(pieces), return_index=True)
+    is_end = np.r_[piece_index[1:] != piece_index[:-1], True]
+
+    # project_geometry follows the boundary of the map along the cut, so add
+    # a vertex at least every degree along the edges which lie on the cut.
+    on_cut = np.abs((xy[:, 0] - cut0 + 180) % 360 - 180) < 2 * eps
+    n_steps = np.ones(len(xy), dtype=int)
+    cut_edge = ~is_end[:-1] & on_cut[:-1] & on_cut[1:]
+    n_steps[:-1][cut_edge] = np.ceil(
+        np.abs(xy[1:, 1] - xy[:-1, 1])[cut_edge]).clip(1)
+    index = np.repeat(np.arange(len(xy)), n_steps)
+    step = np.arange(len(index)) - np.repeat(np.cumsum(n_steps) - n_steps,
+                                             n_steps)
+    after = np.minimum(index + 1, len(xy) - 1)
+    xy = xy[index] + (step / n_steps[index])[:, np.newaxis] * (xy[after] -
+                                                               xy[index])
+    piece_index = piece_index[index]
+
+    # The midpoints of the edges.
+    is_start = np.r_[True, piece_index[1:] != piece_index[:-1]]
+    is_end = np.r_[is_start[1:], True]
+    edge = ~is_end[:-1]
+    xy_mid = ((xy[:-1] + xy[1:]) / 2)[edge]
+
+    projected = target_projection.transform_points(
+        source_projection,
+        np.concatenate([xy[:, 0], xy_mid[:, 0]]),
+        np.concatenate([xy[:, 1], xy_mid[:, 1]]))[:, :2]
+    p_xy, p_mid = projected[:len(xy)], projected[len(xy):]
+
+    # Check that each edge is straight, in the same way as
+    # cartopy.trace.straightAndDomain.
+    threshold = target_projection.threshold
+    with np.errstate(invalid='ignore', divide='ignore'):
+        seg = p_xy[1:][edge] - p_xy[:-1][edge]
+        mid = p_mid - p_xy[:-1][edge]
+        seg_hypot_sq = (seg ** 2).sum(axis=1)
+        along = (seg * mid).sum(axis=1) / seg_hypot_sq
+        separation = (np.abs(mid[:, 0] * seg[:, 1] - mid[:, 1] * seg[:, 0]) /
+                      np.sqrt(seg_hypot_sq))
+        straight = np.isnan(along) | (
+            (0 < along) & (along < 1) &
+            (separation <= threshold * 2 * (0.5 - np.abs(0.5 - along))))
+    straight &= np.isfinite(p_mid).all(axis=1)
+    x0, x1 = target_projection.x_limits
+    y0, y1 = target_projection.y_limits
+    inside = (np.isfinite(p_xy).all(axis=1) &
+              (x0 - threshold <= p_xy[:, 0]) & (p_xy[:, 0] <= x1 + threshold) &
+              (y0 - threshold <= p_xy[:, 1]) & (p_xy[:, 1] <= y1 + threshold))
+    bad_piece = np.zeros(len(pieces), dtype=bool)
+    bad_piece[piece_index[:-1][edge][~straight]] = True
+    bad_piece[piece_index[~inside]] = True
+    ok[cell_index[bad_piece]] = False
+
+    # Make one path per cell, with a ring for each of its pieces. Cells with
+    # no pieces at all are left to project_geometry.
+    codes = np.full(len(xy), mpath.Path.LINETO, dtype=mpath.Path.code_type)
+    codes[is_start] = mpath.Path.MOVETO
+    codes[is_end] = mpath.Path.CLOSEPOLY
+    vertex_cell = cell_index[piece_index]
+    splits = np.flatnonzero(vertex_cell[1:] != vertex_cell[:-1]) + 1
+    key = (source_projection, target_projection)
+    for i, cell_xy, cell_codes in zip(vertex_cell[np.r_[0, splits]],
+                                      np.split(p_xy, splits),
+                                      np.split(codes, splits)):
+        if ok[i]:
+            _PATH_TRANSFORM_CACHE.setdefault(paths[i], {})[key] = mpath.Path(
+                cell_xy, cell_codes)
+
+
 class _ViewClippedPathPatch(mpatches.PathPatch):
     def __init__(self, axes, **kwargs):
         self._original_path = mpath.Path(np.empty((0, 2)))
@@ -1980,6 +2148,11 @@ class GeoAxes(matplotlib.axes.Axes):
         # interpolation when coordinate wraps are involved
         args, kwargs = self._wrap_args(*args, **kwargs)
         result = super().pcolor(*args, **kwargs)
+
+        # Project the cells in one go where possible, so that neither the
+        # datalim calculation nor drawing has to project them one at a time.
+        _cache_projected_cells(result.get_paths(), kwargs['transform'],
+                               self.projection)
 
         # Update the datalim for this pcolor.
         limits = result.get_datalim(self.transData)
